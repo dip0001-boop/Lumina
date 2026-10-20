@@ -1,3 +1,4 @@
+
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,14 +9,20 @@ import { createReadStream, statSync } from 'node:fs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = __dirname;
 const PUBLIC_FILES = new Set(['index.html', 'style.css', 'app.js']);
-
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_MODEL_ID = (process.env.GROQ_MODEL_ID || '').trim();
+
+const GROQ_MODEL_ID =
+  process.env.NODE_ENV === 'test' && process.env.TEST_GROQ_MODEL_ID
+    ? process.env.TEST_GROQ_MODEL_ID.trim()
+    : 'qwen/qwen3.8-27b';
+
 const GROQ_CHAT_COMPLETIONS_URL =
-  (process.env.GROQ_CHAT_COMPLETIONS_URL || '').trim();
+  process.env.NODE_ENV === 'test' && process.env.TEST_GROQ_CHAT_COMPLETIONS_URL
+    ? process.env.TEST_GROQ_CHAT_COMPLETIONS_URL.trim()
+    : 'https://api.groq.com/openai/v1/chat/completions';
 
 const FINE_TUNING_SERVICE_URL =
   (process.env.FINE_TUNING_SERVICE_URL || '').replace(/\/+$/, '');
@@ -33,9 +40,7 @@ const MAX_DATASET_BYTES = parseByteLimit(
 
 function parseByteLimit(raw, fallback) {
   if (!raw) return fallback;
-
   const n = Number(raw);
-
   return Number.isSafeInteger(n) && n > 0 ? n : fallback;
 }
 
@@ -73,11 +78,17 @@ function securityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+
   res.setHeader(
     'Permissions-Policy',
     'camera=(), microphone=(), geolocation=()'
   );
+
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+
+  // The existing application contains inline scripts/styles and a
+  // code editor using dynamic compilation. Avoid breaking those features
+  // with an incompatible Content Security Policy.
 }
 
 function clientIp(req) {
@@ -107,7 +118,6 @@ function rateLimit(req, res, bucketName, perMinute, perDay = 300) {
 
   bucket.minuteCount += 1;
   bucket.dayCount += 1;
-
   rateWindows.set(key, bucket);
 
   if (rateWindows.size > 20_000) {
@@ -118,15 +128,10 @@ function rateLimit(req, res, bucketName, perMinute, perDay = 300) {
     }
   }
 
-  if (
-    bucket.minuteCount > perMinute ||
-    bucket.dayCount > perDay
-  ) {
+  if (bucket.minuteCount > perMinute || bucket.dayCount > perDay) {
     const wait = Math.max(
       1,
-      Math.ceil(
-        (60_000 - (now - bucket.minuteStart)) / 1000
-      )
+      Math.ceil((60_000 - (now - bucket.minuteStart)) / 1000)
     );
 
     json(
@@ -145,15 +150,14 @@ function rateLimit(req, res, bucketName, perMinute, perDay = 300) {
 function originIsAllowed(req) {
   const origin = req.headers.origin;
 
+  // Non-browser clients are handled by validation and rate limits.
   if (!origin) return true;
 
   const host = req.headers.host;
 
   try {
-    return (
-      new URL(origin).host.toLowerCase() ===
-      String(host || '').toLowerCase()
-    );
+    return new URL(origin).host.toLowerCase() ===
+      String(host || '').toLowerCase();
   } catch {
     return false;
   }
@@ -196,9 +200,7 @@ async function readJson(req, maxBytes = 256 * 1024) {
   }
 
   try {
-    return JSON.parse(
-      Buffer.concat(chunks).toString('utf8')
-    );
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
     throw Object.assign(
       new Error('Request body must be valid JSON.'),
@@ -215,7 +217,7 @@ function safeMessageList(body) {
     body.messages.length > 40
   ) {
     throw Object.assign(
-      new Error('messages must contain 1–40 messages.'),
+      new Error('messages must be an array containing 1–40 messages.'),
       { status: 400 }
     );
   }
@@ -263,39 +265,29 @@ function safeMessageList(body) {
 }
 
 const BASE_SYSTEM_PROMPT =
-  `You are Lumina-1.0, the AI product developed by Reason Intelligence, founded by Vince Dipisa. Be helpful, precise, and candid. Use the model configured by the server operator. Answer factual questions honestly. Never claim you ran code, executed tools, browsed the web, or verified an external action unless that action actually occurred.`;
+  `You are Lumina-1.0, the AI product developed by Reason Intelligence, founded by Vince Dipisa. Be helpful, precise, and candid. Do not falsely claim that Reason Intelligence trained the underlying base-model weights. Use the model configured by the server operator. Avoid irrelevant provider or model-provenance discussion; answer factual questions about provenance honestly when directly asked. Never claim you ran code, executed tools, browsed the web, or verified an external action unless that action actually occurred.`;
 
 const CODE_SYSTEM_PROMPT =
-  `You are Lumina-1.0 operating in the application's coding workflow. When creating or modifying software, provide complete files in fenced code blocks with explicit filenames, such as html index.html, css style.css, and javascript app.js. Keep explanation outside code blocks. Do not state that code was executed, tested, or deployed unless that action actually occurred. Prefer correct, maintainable vanilla HTML/CSS/JavaScript when suitable. Product identity: Lumina-1.0 is developed by Reason Intelligence, founded by Vince Dipisa.`;
+  `You are Lumina-1.0 operating in the application's coding workflow. When creating or modifying software, provide complete files in fenced code blocks with explicit filenames in the fence, such as \`\`\`html index.html, \`\`\`css style.css, and \`\`\`javascript app.js. Keep explanation outside the code blocks. Do not state that code was executed, tested, or deployed unless the action was actually performed. Prefer correct, maintainable vanilla HTML/CSS/JavaScript when suitable. Product identity: Lumina-1.0 is developed by Reason Intelligence, founded by Vince Dipisa.`;
 
 async function handleChat(req, res) {
   if (!sameOriginGuard(req, res)) return;
 
-  if (!rateLimit(
-    req,
-    res,
-    'chat',
-    30,
-    Number(process.env.CHAT_DAILY_LIMIT || 200)
-  )) {
+  if (
+    !rateLimit(
+      req,
+      res,
+      'chat',
+      30,
+      Number(process.env.CHAT_DAILY_LIMIT || 200)
+    )
+  ) {
     return;
   }
 
   if (!GROQ_API_KEY) {
     return json(res, 503, {
-      error: 'Groq credentials are not configured. Set GROQ_API_KEY on the server.'
-    });
-  }
-
-  if (!GROQ_MODEL_ID) {
-    return json(res, 503, {
-      error: 'The inference model is not configured. Set GROQ_MODEL_ID when ready.'
-    });
-  }
-
-  if (!GROQ_CHAT_COMPLETIONS_URL) {
-    return json(res, 503, {
-      error: 'The chat endpoint is not configured. Set GROQ_CHAT_COMPLETIONS_URL when ready.'
+      error: 'Groq is not configured. Add GROQ_API_KEY to the server environment.'
     });
   }
 
@@ -321,19 +313,25 @@ async function handleChat(req, res) {
 
   const mode = body.mode === 'code' ? 'code' : 'chat';
 
+  const reasoningEffort =
+    body.effort === 'maximum' ? 'high' : 'medium';
+
   const payload = {
     model: GROQ_MODEL_ID,
+
     messages: [
       {
         role: 'system',
-        content:
-          mode === 'code'
-            ? CODE_SYSTEM_PROMPT
-            : BASE_SYSTEM_PROMPT
+        content: mode === 'code'
+          ? CODE_SYSTEM_PROMPT
+          : BASE_SYSTEM_PROMPT
       },
       ...messages
     ],
+
     stream: body.stream !== false,
+    reasoning_effort: reasoningEffort,
+
     max_completion_tokens: Math.max(
       128,
       Math.min(
@@ -346,23 +344,9 @@ async function handleChat(req, res) {
   let upstream;
 
   try {
-    const endpoint = new URL(GROQ_CHAT_COMPLETIONS_URL);
-
-    if (
-      !['https:', 'http:'].includes(endpoint.protocol) ||
-      (
-        endpoint.protocol === 'http:' &&
-        !['localhost', '127.0.0.1', '::1']
-          .includes(endpoint.hostname)
-      )
-    ) {
-      return json(res, 500, {
-        error: 'The server chat endpoint must use HTTPS.'
-      });
-    }
-
-    upstream = await fetch(endpoint, {
+    upstream = await fetch(GROQ_CHAT_COMPLETIONS_URL, {
       method: 'POST',
+
       headers: {
         Authorization: `Bearer ${GROQ_API_KEY}`,
         'Content-Type': 'application/json',
@@ -370,15 +354,15 @@ async function handleChat(req, res) {
           ? 'text/event-stream'
           : 'application/json'
       },
+
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(120_000)
     });
   } catch (error) {
     return json(res, 502, {
-      error:
-        error.name === 'TimeoutError'
-          ? 'The model request timed out.'
-          : 'Could not connect to the configured inference service.'
+      error: error.name === 'TimeoutError'
+        ? 'Groq request timed out.'
+        : 'Could not connect to Groq. Check the server network and API key.'
     });
   }
 
@@ -397,10 +381,16 @@ async function handleChat(req, res) {
       // Do not echo arbitrary upstream response bodies.
     }
 
-    return json(res, upstream.status, {
-      error: `The inference service returned HTTP ${upstream.status}.`,
-      ...(detail ? { details: detail } : {})
-    });
+    return json(
+      res,
+      upstream.status >= 400 && upstream.status < 600
+        ? upstream.status
+        : 502,
+      {
+        error: `Groq returned HTTP ${upstream.status}.`,
+        ...(detail ? { details: detail } : {})
+      }
+    );
   }
 
   if (!payload.stream) {
@@ -408,7 +398,7 @@ async function handleChat(req, res) {
 
     if (!data) {
       return json(res, 502, {
-        error: 'The inference service returned an unreadable response.'
+        error: 'Groq returned an unreadable response.'
       });
     }
 
@@ -430,7 +420,7 @@ async function handleChat(req, res) {
   } catch {
     if (!res.headersSent) {
       json(res, 502, {
-        error: 'Failed to stream the inference response.'
+        error: 'Failed to stream the Groq response.'
       });
     } else {
       res.end();
@@ -467,7 +457,7 @@ function fineTuneConfigured() {
 function authorizeFineTune(req, res) {
   if (!fineTuneConfigured()) {
     json(res, 503, {
-      error: 'Fine-tuning is not configured. Set FINE_TUNING_SERVICE_URL, FINE_TUNING_SERVICE_TOKEN, and FINE_TUNE_ADMIN_TOKEN, and connect a compatible training worker.'
+      error: 'Fine-tuning is not configured. Set FINE_TUNING_SERVICE_URL, FINE_TUNING_SERVICE_TOKEN, and FINE_TUNE_ADMIN_TOKEN on the server, and connect a compatible training worker.'
     });
 
     return false;
@@ -501,8 +491,7 @@ function workerUrl(endpoint) {
     !['https:', 'http:'].includes(base.protocol) ||
     (
       base.protocol === 'http:' &&
-      !['localhost', '127.0.0.1', '::1']
-        .includes(base.hostname)
+      !['localhost', '127.0.0.1', '::1'].includes(base.hostname)
     )
   ) {
     throw new Error(
@@ -568,7 +557,7 @@ async function proxyFineTuneJobCreate(req, res) {
     /[\r\n]/.test(baseModel)
   ) {
     return json(res, 503, {
-      error: 'The fine-tuning target model is not configured. Set GROQ_MODEL_ID or choose a target in the training client.'
+      error: 'The fine-tuning target model is not configured. Set the model in server.js or choose a target model in the training client.'
     });
   }
 
@@ -598,7 +587,7 @@ async function proxyFineTuneJobCreate(req, res) {
     }
   } catch {
     return json(res, 400, {
-      error: 'Training configuration is invalid JSON.'
+      error: 'Training configuration header is invalid JSON.'
     });
   }
 
@@ -628,7 +617,7 @@ async function proxyFineTuneJobCreate(req, res) {
 
   if (declaredLength > MAX_DATASET_BYTES) {
     return json(res, 413, {
-      error: `Dataset exceeds the ${MAX_DATASET_BYTES}-byte upload limit.`
+      error: `Dataset exceeds the server upload limit of ${MAX_DATASET_BYTES} bytes.`
     });
   }
 
@@ -660,6 +649,7 @@ async function proxyFineTuneJobCreate(req, res) {
   try {
     upstream = await fetch(workerUrl('jobs'), {
       method: 'POST',
+
       headers: {
         Authorization: `Bearer ${FINE_TUNING_SERVICE_TOKEN}`,
         'Content-Type': 'application/x-ndjson',
@@ -675,6 +665,7 @@ async function proxyFineTuneJobCreate(req, res) {
         }),
         'X-Application': 'Lumina-1.0'
       },
+
       body: Readable.toWeb(limiter),
       duplex: 'half',
       signal: AbortSignal.timeout(30 * 60 * 1000)
@@ -690,7 +681,7 @@ async function proxyFineTuneJobCreate(req, res) {
     }
 
     return json(res, 502, {
-      error: 'Could not submit the training job. Check the configured worker.'
+      error: 'Could not submit the training job. Check the configured training worker and its documented API contract.'
     });
   }
 
@@ -734,11 +725,13 @@ async function proxyFineTuneControl(req, res, jobId, action) {
       ),
       {
         method: action === 'cancel' ? 'POST' : 'GET',
+
         headers: {
           Authorization: `Bearer ${FINE_TUNING_SERVICE_TOKEN}`,
           Accept: 'application/json',
           'X-Application': 'Lumina-1.0'
         },
+
         signal: AbortSignal.timeout(30_000)
       }
     );
@@ -757,13 +750,10 @@ function health(req, res) {
     product: 'Lumina-1.0',
     provider: 'Groq',
     modelLabel: 'Lumina-1.0',
-    providerConfigured: Boolean(
-      GROQ_API_KEY &&
-      GROQ_MODEL_ID &&
-      GROQ_CHAT_COMPLETIONS_URL
-    ),
+    providerConfigured: Boolean(GROQ_API_KEY),
     modelConfigured: Boolean(GROQ_MODEL_ID),
-    endpointConfigured: Boolean(GROQ_CHAT_COMPLETIONS_URL),
+    endpointConfigured: true,
+    chatReady: Boolean(GROQ_API_KEY && GROQ_MODEL_ID),
     fineTuningConfigured: fineTuneConfigured(),
     timestamp: new Date().toISOString()
   });
@@ -784,11 +774,11 @@ function serveStatic(req, res) {
 
   if (pathname === '/') pathname = '/index.html';
 
+  // Only serve the public frontend assets.
   const filename = pathname.startsWith('/')
     ? pathname.slice(1)
     : pathname;
 
-  // Only expose frontend assets over HTTP.
   if (
     !PUBLIC_FILES.has(filename) ||
     filename.includes('/') ||
@@ -924,20 +914,10 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`Lumina-1.0 listening on ${HOST}:${PORT}`);
-
-  console.log(
-    `Groq provider configured: ${
-      Boolean(
-        GROQ_API_KEY &&
-        GROQ_MODEL_ID &&
-        GROQ_CHAT_COMPLETIONS_URL
-      )
-    }`
-  );
-
-  console.log(
-    `Fine-tuning worker configured: ${fineTuneConfigured()}`
-  );
+  console.log(`Groq API key configured: ${Boolean(GROQ_API_KEY)}`);
+  console.log('Groq endpoint: configured in server.js');
+  console.log(`Groq model configured in source: ${Boolean(GROQ_MODEL_ID)}`);
+  console.log(`Fine-tuning worker configured: ${fineTuneConfigured()}`);
 });
 
 export { server };
