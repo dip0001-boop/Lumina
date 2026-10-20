@@ -11,8 +11,6 @@ services:
         value: production
       - key: GROQ_API_KEY
         sync: false
-      - key: GROQ_MODEL_ID
-        value: openai/gpt-oss-120b
       - key: FINE_TUNING_SERVICE_URL
         sync: false
       - key: FINE_TUNING_SERVICE_TOKEN
