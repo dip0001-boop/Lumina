@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: lumina-1-0
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL_ID
+        value: openai/gpt-oss-120b
+      - key: FINE_TUNING_SERVICE_URL
+        sync: false
+      - key: FINE_TUNING_SERVICE_TOKEN
+        sync: false
+      - key: FINE_TUNE_ADMIN_TOKEN
+        sync: false
+      - key: MAX_TUNING_DATASET_BYTES
+        value: "2147483648"
