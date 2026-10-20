@@ -1,30 +1,29 @@
+
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable, Transform } from 'node:stream';
-import { StringDecoder } from 'node:string_decoder';
 import { createReadStream, statSync } from 'node:fs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PUBLIC_DIR = __dirname;
-const PUBLIC_FILES = new Set(['index.html', 'style.css', 'app.js']);
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
+
+const PUBLIC_FILES = new Set([
+  'index.html',
+  'style.css',
+  'app.js'
+]);
 
 // The only required Groq environment variable.
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 
-const GROQ_MODEL_ID =
-  process.env.NODE_ENV === 'test' && process.env.TEST_GROQ_MODEL_ID
-    ? process.env.TEST_GROQ_MODEL_ID.trim()
-    : 'openai/gpt-oss-120b';
+// Internal model configuration. The browser only displays Lumina-1.0.
+const GROQ_MODEL_ID = 'openai/gpt-oss-120b';
+const GROQ_URL =
+  'https://api.groq.com/openai/v1/chat/completions';
 
-const GROQ_CHAT_COMPLETIONS_URL =
-  process.env.NODE_ENV === 'test' && process.env.TEST_GROQ_CHAT_COMPLETIONS_URL
-    ? process.env.TEST_GROQ_CHAT_COMPLETIONS_URL.trim()
-    : 'https://api.groq.com/openai/v1/chat/completions';
-
-const MIME_TYPES = {
+const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -34,66 +33,84 @@ const MIME_TYPES = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
-  '.ico': 'image/x-icon',
-  '.txt': 'text/plain; charset=utf-8'
+  '.ico': 'image/x-icon'
 };
 
-const rateWindows = new Map();
+const rateLimits = new Map();
 
+const MAX_BODY_BYTES = 256 * 1024;
 const INPUT_TOKEN_BUDGET = 4800;
-const MAX_COMPLETION_TOKENS = 2048;
-const ESTIMATED_BYTES_PER_TOKEN = 2.5;
+const MAX_OUTPUT_TOKENS = 2048;
 
-const BASE_SYSTEM_PROMPT =
-  'You are Lumina-1.0, developed by Reason Intelligence, founded by Vince Dipisa. ' +
-  'Be helpful, precise, and candid. Identify the product as Lumina-1.0 only. ' +
-  'Do not disclose internal model identifiers or routing configuration. ' +
-  'Never claim to have performed an action unless it actually occurred.';
+// Keep product messaging separate from the internal model identifier.
+const SYSTEM_PROMPTS = {
+  chat:
+    'You are Lumina-1.0, developed by Reason Intelligence, founded by Vince Dipisa. ' +
+    'Be helpful, accurate and candid. Identify the product as Lumina-1.0. ' +
+    'Do not unnecessarily disclose internal routing identifiers. ' +
+    'Never claim to have performed an action unless it actually happened.',
 
-const CODE_SYSTEM_PROMPT =
-  'You are Lumina-1.0 operating in the coding workflow. ' +
-  'Provide complete files with filenames when creating software. ' +
-  'Keep explanations outside code blocks. Never claim code was executed, ' +
-  'tested, or deployed unless that actually occurred. Prefer maintainable ' +
-  'HTML, CSS, and JavaScript when suitable. ' +
-  'Lumina-1.0 is developed by Reason Intelligence, founded by Vince Dipisa. ' +
-  'Do not disclose internal model identifiers or routing configuration.';
+  code:
+    'You are Lumina-1.0 in coding mode. ' +
+    'Provide complete files with filenames when creating software. ' +
+    'Keep explanations outside code blocks. Never claim code was executed, ' +
+    'tested or deployed unless it actually happened. ' +
+    'Prefer maintainable HTML, CSS and JavaScript where suitable. ' +
+    'Lumina-1.0 is developed by Reason Intelligence, founded by Vince Dipisa. ' +
+    'Identify the product as Lumina-1.0.'
+};
 
-function json(res, status, value, extraHeaders = {}) {
-  const bytes = Buffer.from(JSON.stringify(value));
+function json(res, status, data, additionalHeaders = {}) {
+  if (res.writableEnded) return;
+
+  const bytes = Buffer.from(JSON.stringify(data));
 
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': bytes.length,
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
-    ...extraHeaders
+    ...additionalHeaders
   });
 
   res.end(bytes);
 }
 
-function setSecurityHeaders(res) {
+function securityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader(
     'Permissions-Policy',
     'camera=(), microphone=(), geolocation=()'
   );
-  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
 }
 
-function clientIp(req) {
-  return req.socket?.remoteAddress || 'unknown';
+function checkOrigin(req, res) {
+  const origin = req.headers.origin;
+
+  // Requests without Origin are allowed for non-browser clients.
+  if (!origin) return true;
+
+  try {
+    const originHost = new URL(origin).host.toLowerCase();
+    const requestHost = String(req.headers.host || '').toLowerCase();
+
+    if (originHost === requestHost) return true;
+  } catch {
+    // Reject malformed origins below.
+  }
+
+  json(res, 403, { error: 'Cross-origin request rejected.' });
+  return false;
 }
 
-function rateLimit(req, res, bucketName, perMinute, perDay = 300) {
-  const key = `${bucketName}:${clientIp(req)}`;
+function rateLimit(req, res, name, perMinute = 30, perDay = 200) {
+  const key = `${name}:${req.socket?.remoteAddress || 'unknown'}`;
   const now = Date.now();
   const day = Math.floor(now / 86400000);
 
-  let bucket = rateWindows.get(key);
+  let bucket = rateLimits.get(key);
 
   if (!bucket || bucket.day !== day) {
     bucket = {
@@ -111,28 +128,25 @@ function rateLimit(req, res, bucketName, perMinute, perDay = 300) {
 
   bucket.minuteCount++;
   bucket.dayCount++;
+  rateLimits.set(key, bucket);
 
-  rateWindows.set(key, bucket);
-
-  if (rateWindows.size > 20000) {
-    for (const [storedKey, value] of rateWindows) {
+  if (rateLimits.size > 10000) {
+    for (const [storedKey, value] of rateLimits) {
       if (now - value.minuteStart > 86400000) {
-        rateWindows.delete(storedKey);
+        rateLimits.delete(storedKey);
       }
     }
   }
 
-  if (bucket.minuteCount > perMinute || bucket.dayCount > perDay) {
-    const wait = Math.max(
-      1,
-      Math.ceil((60000 - (now - bucket.minuteStart)) / 1000)
-    );
-
+  if (
+    bucket.minuteCount > perMinute ||
+    bucket.dayCount > perDay
+  ) {
     json(
       res,
       429,
-      { error: 'Rate limit reached. Please try again later.' },
-      { 'Retry-After': String(wait) }
+      { error: 'Rate limit reached. Please retry shortly.' },
+      { 'Retry-After': '60' }
     );
 
     return false;
@@ -141,46 +155,23 @@ function rateLimit(req, res, bucketName, perMinute, perDay = 300) {
   return true;
 }
 
-function sameOriginGuard(req, res) {
-  const origin = req.headers.origin;
-
-  if (!origin) return true;
-
-  try {
-    if (
-      new URL(origin).host.toLowerCase() ===
-      String(req.headers.host || '').toLowerCase()
-    ) {
-      return true;
-    }
-  } catch {
-    // Reject malformed Origin headers below.
-  }
-
-  json(res, 403, {
-    error: 'Cross-origin request rejected.'
-  });
-
-  return false;
-}
-
-async function readJson(req, maxBytes = 256 * 1024) {
+async function readJSON(req) {
   const declared = Number(req.headers['content-length'] || 0);
 
-  if (declared > maxBytes) {
+  if (declared > MAX_BODY_BYTES) {
     throw Object.assign(
       new Error('Request body is too large.'),
       { status: 413 }
     );
   }
 
-  let total = 0;
   const chunks = [];
+  let total = 0;
 
   for await (const chunk of req) {
     total += chunk.length;
 
-    if (total > maxBytes) {
+    if (total > MAX_BODY_BYTES) {
       throw Object.assign(
         new Error('Request body is too large.'),
         { status: 413 }
@@ -213,7 +204,7 @@ function validateMessages(body) {
     );
   }
 
-  let totalChars = 0;
+  let totalCharacters = 0;
 
   const messages = body.messages.map((message, index) => {
     if (
@@ -223,7 +214,7 @@ function validateMessages(body) {
       typeof message.content !== 'string'
     ) {
       throw Object.assign(
-        new Error(`Invalid message at position ${index + 1}.`),
+        new Error(`Invalid message ${index + 1}.`),
         { status: 400 }
       );
     }
@@ -237,15 +228,12 @@ function validateMessages(body) {
       );
     }
 
-    totalChars += content.length;
+    totalCharacters += content.length;
 
-    return {
-      role: message.role,
-      content
-    };
+    return { role: message.role, content };
   });
 
-  if (totalChars > 180000) {
+  if (totalCharacters > 180000) {
     throw Object.assign(
       new Error('Conversation is too large.'),
       { status: 413 }
@@ -255,69 +243,61 @@ function validateMessages(body) {
   return messages;
 }
 
-function estimateTokens(text) {
-  return Math.ceil(
-    Buffer.byteLength(String(text), 'utf8') /
-    ESTIMATED_BYTES_PER_TOKEN
-  );
+// Conservative token estimate: this is not the model's exact tokenizer.
+function estimateTokens(value) {
+  return Math.ceil(Buffer.byteLength(String(value), 'utf8') / 2.5);
 }
 
-function truncateUtf8ToBytes(text, maxBytes) {
+function shortenText(text, maxBytes) {
   const source = String(text);
 
   if (Buffer.byteLength(source, 'utf8') <= maxBytes) {
     return source;
   }
 
-  const marker =
-    '\n\n[Content shortened to fit the current request budget]\n\n';
+  const marker = '\n\n[Earlier or excess text omitted]\n\n';
+  const available = Math.max(
+    0,
+    maxBytes - Buffer.byteLength(marker, 'utf8')
+  );
 
-  const markerBytes = Buffer.byteLength(marker, 'utf8');
-
-  if (maxBytes <= markerBytes + 8) {
-    return Array.from(source)
-      .slice(0, Math.max(1, Math.floor(maxBytes / 2)))
-      .join('');
-  }
-
-  const available = maxBytes - markerBytes;
-  const prefixBudget = Math.floor(available * 0.72);
-  const suffixBudget = available - prefixBudget;
   const chars = Array.from(source);
+  const leftBudget = Math.floor(available * 0.7);
+  const rightBudget = available - leftBudget;
 
-  let prefix = '';
-  let usedPrefix = 0;
+  let left = '';
+  let leftBytes = 0;
 
   for (const char of chars) {
     const size = Buffer.byteLength(char, 'utf8');
 
-    if (usedPrefix + size > prefixBudget) break;
+    if (leftBytes + size > leftBudget) break;
 
-    prefix += char;
-    usedPrefix += size;
+    left += char;
+    leftBytes += size;
   }
 
-  let suffix = '';
-  let usedSuffix = 0;
+  let right = '';
+  let rightBytes = 0;
 
   for (let i = chars.length - 1; i >= 0; i--) {
     const char = chars[i];
     const size = Buffer.byteLength(char, 'utf8');
 
-    if (usedSuffix + size > suffixBudget) break;
+    if (rightBytes + size > rightBudget) break;
 
-    suffix = char + suffix;
-    usedSuffix += size;
+    right = char + right;
+    rightBytes += size;
   }
 
-  return prefix + marker + suffix;
+  return left + marker + right;
 }
 
-function capPromptMessages(messages, systemPrompt) {
-  let remaining = Math.max(
-    256,
-    INPUT_TOKEN_BUDGET - estimateTokens(systemPrompt) - 96
-  );
+function fitConversation(messages, systemPrompt) {
+  let remaining =
+    INPUT_TOKEN_BUDGET - estimateTokens(systemPrompt) - 100;
+
+  remaining = Math.max(256, remaining);
 
   const newestFirst = [];
 
@@ -331,21 +311,13 @@ function capPromptMessages(messages, systemPrompt) {
       continue;
     }
 
-    // Preserve the latest question even when it is too large.
+    // Preserve the latest user request even when it is unusually long.
     if (newestFirst.length === 0) {
-      const allowedBytes = Math.max(
-        256,
-        Math.floor(
-          (remaining - 8) * ESTIMATED_BYTES_PER_TOKEN
-        )
-      );
+      const maxBytes = Math.max(256, Math.floor(remaining * 2.5));
 
       newestFirst.push({
         role: message.role,
-        content: truncateUtf8ToBytes(
-          message.content,
-          allowedBytes
-        )
+        content: shortenText(message.content, maxBytes)
       });
     }
 
@@ -355,35 +327,35 @@ function capPromptMessages(messages, systemPrompt) {
   return newestFirst.reverse();
 }
 
-function sanitizePublicString(value) {
-  return String(value)
+function sanitizeText(text) {
+  return String(text)
     .replace(
       /(?:openai\s*\/\s*)?gpt[\s_-]*oss(?:[\s_-]*model)?[\s_-]*120b/gi,
       'Lumina-1.0'
     )
-    .replace(/\bopenai\b/gi, 'inference service');
+    .replace(/\bopenai\b/gi, 'inference provider');
 }
 
-function sanitizePublicPayload(value, key = '') {
+function sanitizePayload(value, key = '') {
   if (
-    /^(?:base[_-]?model(?:[_-]?id)?|model(?:[_-]?id|[_-]?name)?)$/i
+    /^(?:model|model_id|model_name|base_model|base_model_id)$/i
       .test(key)
   ) {
     return 'Lumina-1.0';
   }
 
   if (typeof value === 'string') {
-    return sanitizePublicString(value);
+    return sanitizeText(value);
   }
 
   if (Array.isArray(value)) {
-    return value.map(item => sanitizePublicPayload(item));
+    return value.map(item => sanitizePayload(item));
   }
 
   if (value && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value).map(
-        ([k, v]) => [k, sanitizePublicPayload(v, k)]
+        ([name, item]) => [name, sanitizePayload(item, name)]
       )
     );
   }
@@ -391,118 +363,48 @@ function sanitizePublicPayload(value, key = '') {
   return value;
 }
 
-function createPublicSSEFilter() {
-  const decoder = new StringDecoder('utf8');
+// Convert each complete SSE event to public-safe JSON.
+function publicStreamFilter() {
   let buffer = '';
-  let pendingContent = '';
-  const holdback = 64;
-
-  function redactContent(fragment, final = false) {
-    const combined = sanitizePublicString(
-      pendingContent + String(fragment || '')
-    );
-
-    if (final) {
-      pendingContent = '';
-      return combined;
-    }
-
-    const chars = Array.from(combined);
-
-    if (chars.length <= holdback) {
-      pendingContent = combined;
-      return '';
-    }
-
-    const cut = chars.length - holdback;
-    const safe = chars.slice(0, cut).join('');
-
-    pendingContent = chars.slice(cut).join('');
-
-    return safe;
-  }
-
-  function sanitizeStreamPayload(value, key = '') {
-    if (
-      /^(?:base[_-]?model(?:[_-]?id)?|model(?:[_-]?id|[_-]?name)?)$/i
-        .test(key)
-    ) {
-      return 'Lumina-1.0';
-    }
-
-    if (typeof value === 'string') {
-      if (/^(?:content|text)$/i.test(key)) {
-        return redactContent(value);
-      }
-
-      return sanitizePublicString(value);
-    }
-
-    if (Array.isArray(value)) {
-      return value.map(item => sanitizeStreamPayload(item));
-    }
-
-    if (value && typeof value === 'object') {
-      return Object.fromEntries(
-        Object.entries(value).map(
-          ([k, v]) => [k, sanitizeStreamPayload(v, k)]
-        )
-      );
-    }
-
-    return value;
-  }
 
   function processEvent(eventText) {
     const lines = eventText.split(/\r?\n/);
     const dataLines = lines.filter(line => line.startsWith('data:'));
 
     if (!dataLines.length) {
-      return sanitizePublicString(eventText) + '\n\n';
+      return sanitizeText(eventText) + '\n\n';
     }
 
-    const rawData = dataLines
+    const raw = dataLines
       .map(line => line.slice(5).replace(/^ /, ''))
       .join('\n');
 
-    if (rawData.trim() === '[DONE]') {
-      const finalContent = redactContent('', true);
-      let output = '';
-
-      if (finalContent) {
-        output += 'data: ' + JSON.stringify({
-          choices: [{ delta: { content: finalContent } }]
-        }) + '\n\n';
-      }
-
-      return output + 'data: [DONE]\n\n';
+    if (raw.trim() === '[DONE]') {
+      return 'data: [DONE]\n\n';
     }
 
     try {
-      const payload = JSON.parse(rawData);
-      const safePayload = sanitizeStreamPayload(payload);
-      const prefixLines = lines.filter(line => !line.startsWith('data:'));
-      const prefix = prefixLines.length
-        ? prefixLines.join('\n') + '\n'
+      const payload = sanitizePayload(JSON.parse(raw));
+      const metadata = lines.filter(line => !line.startsWith('data:'));
+      const prefix = metadata.length
+        ? metadata.join('\n') + '\n'
         : '';
 
-      return prefix +
-        'data: ' +
-        JSON.stringify(safePayload) +
-        '\n\n';
+      return prefix + 'data: ' + JSON.stringify(payload) + '\n\n';
     } catch {
-      return 'data: ' + sanitizePublicString(rawData) + '\n\n';
+      return 'data: ' + sanitizeText(raw) + '\n\n';
     }
   }
 
   return new Transform({
-    transform(chunk, _encoding, callback) {
-      buffer += decoder.write(chunk);
+    transform(chunk, encoding, callback) {
+      buffer += chunk.toString('utf8');
 
       const output = [];
+
       let boundary;
 
-      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+      while ((boundary = buffer.indexOf('\n\n')) !== -1) {
         output.push(processEvent(buffer.slice(0, boundary)));
         buffer = buffer.slice(boundary + 2);
       }
@@ -511,20 +413,10 @@ function createPublicSSEFilter() {
     },
 
     flush(callback) {
-      buffer += decoder.end();
-
       let output = '';
 
       if (buffer.trim()) {
         output += processEvent(buffer);
-      }
-
-      const finalContent = redactContent('', true);
-
-      if (finalContent) {
-        output += 'data: ' + JSON.stringify({
-          choices: [{ delta: { content: finalContent } }]
-        }) + '\n\n';
       }
 
       callback(null, output);
@@ -533,32 +425,24 @@ function createPublicSSEFilter() {
 }
 
 async function handleChat(req, res) {
-  if (!sameOriginGuard(req, res)) return;
+  if (!checkOrigin(req, res)) return;
 
-  if (!rateLimit(
-    req,
-    res,
-    'chat',
-    30,
-    Number(process.env.CHAT_DAILY_LIMIT || 200)
-  )) {
+  if (!rateLimit(req, res, 'chat', 30, Number(process.env.CHAT_DAILY_LIMIT || 200))) {
     return;
   }
 
   if (!GROQ_API_KEY) {
     return json(res, 503, {
-      error: 'Groq is not configured. Set GROQ_API_KEY on the server.'
+      error: 'Chat is not configured. Add GROQ_API_KEY to the server environment.'
     });
   }
 
   let body;
 
   try {
-    body = await readJson(req);
+    body = await readJSON(req);
   } catch (error) {
-    return json(res, error.status || 400, {
-      error: error.message
-    });
+    return json(res, error.status || 400, { error: error.message });
   }
 
   let messages;
@@ -566,37 +450,18 @@ async function handleChat(req, res) {
   try {
     messages = validateMessages(body);
   } catch (error) {
-    return json(res, error.status || 400, {
-      error: error.message
-    });
+    return json(res, error.status || 400, { error: error.message });
   }
 
   const mode = body.mode === 'code' ? 'code' : 'chat';
-  const systemPrompt = mode === 'code'
-    ? CODE_SYSTEM_PROMPT
-    : BASE_SYSTEM_PROMPT;
-
-  const reasoningEffort = body.effort === 'maximum'
-    ? 'high'
-    : 'medium';
+  const systemPrompt = SYSTEM_PROMPTS[mode];
+  const boundedMessages = fitConversation(messages, systemPrompt);
 
   const requestedTokens = Number(body.max_completion_tokens);
-
-  const maxCompletionTokens =
+  const maxTokens =
     Number.isFinite(requestedTokens) && requestedTokens > 0
-      ? Math.max(
-          256,
-          Math.min(
-            MAX_COMPLETION_TOKENS,
-            Math.floor(requestedTokens)
-          )
-        )
-      : MAX_COMPLETION_TOKENS;
-
-  const boundedMessages = capPromptMessages(
-    messages,
-    systemPrompt
-  );
+      ? Math.min(MAX_OUTPUT_TOKENS, Math.max(256, Math.floor(requestedTokens)))
+      : MAX_OUTPUT_TOKENS;
 
   const payload = {
     model: GROQ_MODEL_ID,
@@ -605,14 +470,16 @@ async function handleChat(req, res) {
       ...boundedMessages
     ],
     stream: body.stream !== false,
-    reasoning_effort: reasoningEffort,
-    max_completion_tokens: maxCompletionTokens
+    max_completion_tokens: maxTokens,
+    reasoning_effort: ['low', 'medium', 'high'].includes(body.effort)
+      ? body.effort
+      : 'medium'
   };
 
   let upstream;
 
   try {
-    upstream = await fetch(GROQ_CHAT_COMPLETIONS_URL, {
+    upstream = await fetch(GROQ_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${GROQ_API_KEY}`,
@@ -627,62 +494,51 @@ async function handleChat(req, res) {
   } catch (error) {
     return json(res, 502, {
       error: error.name === 'TimeoutError'
-        ? 'Lumina request timed out.'
-        : 'Could not connect to the configured inference service.'
+        ? 'Lumina request timed out. Please retry.'
+        : 'Could not connect to the configured chat service.'
     });
   }
 
   if (!upstream.ok) {
-    let upstreamError = '';
+    let details = '';
 
     try {
-      const errorBody = await upstream.json();
+      const result = await upstream.json();
 
-      upstreamError = String(
-        errorBody?.error?.message ||
-        errorBody?.message ||
-        ''
+      details = String(
+        result?.error?.message || result?.message || ''
       );
     } catch {
-      // Keep provider details private.
+      // Do not expose arbitrary upstream response content.
     }
 
     if (
       upstream.status === 413 ||
-      /request too large|tokens per minute|\bTPM\b|requested \d+.*limit/i
-        .test(upstreamError)
+      /request too large|tokens per minute|\bTPM\b|requested \d+.*limit/i.test(details)
     ) {
       return json(res, 413, {
         error:
-          'This conversation was too large for the current request budget. ' +
-          'Lumina automatically limits older context and response length. ' +
-          'Please retry or start a new chat.'
+          'This conversation exceeded the available request budget. ' +
+          'Lumina trims older conversation history automatically. ' +
+          'Retry or start a new chat.'
       });
     }
 
-    return json(
-      res,
-      upstream.status >= 400 && upstream.status < 600
-        ? upstream.status
-        : 502,
-      {
-        error:
-          `Lumina could not complete the request (HTTP ${upstream.status}). ` +
-          'Please retry shortly.'
-      }
-    );
+    return json(res, 502, {
+      error: `Lumina could not complete the request (HTTP ${upstream.status}). Please retry shortly.`
+    });
   }
 
   if (!payload.stream) {
-    const data = await upstream.json().catch(() => null);
+    const result = await upstream.json().catch(() => null);
 
-    if (!data) {
+    if (!result) {
       return json(res, 502, {
-        error: 'The inference service returned an unreadable response.'
+        error: 'The chat service returned an unreadable response.'
       });
     }
 
-    return json(res, 200, sanitizePublicPayload(data));
+    return json(res, 200, sanitizePayload(result));
   }
 
   res.writeHead(200, {
@@ -697,13 +553,11 @@ async function handleChat(req, res) {
 
   try {
     Readable.fromWeb(upstream.body)
-      .pipe(createPublicSSEFilter())
+      .pipe(publicStreamFilter())
       .pipe(res);
   } catch {
     if (!res.headersSent) {
-      json(res, 502, {
-        error: 'Failed to stream the response.'
-      });
+      json(res, 502, { error: 'Could not stream the response.' });
     } else {
       res.end();
     }
@@ -721,8 +575,7 @@ function health(_req, res) {
     status: 'ok',
     product: 'Lumina-1.0',
     modelLabel: 'Lumina-1.0',
-    providerConfigured: Boolean(GROQ_API_KEY),
-    chatReady: Boolean(GROQ_API_KEY && GROQ_MODEL_ID),
+    chatReady: Boolean(GROQ_API_KEY),
     timestamp: new Date().toISOString()
   });
 }
@@ -735,9 +588,7 @@ function serveStatic(req, res) {
       new URL(req.url, 'http://localhost').pathname
     );
   } catch {
-    return json(res, 400, {
-      error: 'Invalid URL.'
-    });
+    return json(res, 400, { error: 'Invalid URL.' });
   }
 
   if (pathname === '/') pathname = '/index.html';
@@ -746,43 +597,32 @@ function serveStatic(req, res) {
     ? pathname.slice(1)
     : pathname;
 
-  // The original local Training Laboratory remains in app.js.
-  // Only the frontend files are available over HTTP.
+  // Only expose the public browser app files.
   if (
     !PUBLIC_FILES.has(filename) ||
     filename.includes('/') ||
     filename.includes('\\')
   ) {
-    return json(res, 404, {
-      error: 'Not found.'
-    });
+    return json(res, 404, { error: 'Not found.' });
   }
 
-  const fullPath = path.join(PUBLIC_DIR, filename);
+  const fullPath = path.join(ROOT, filename);
   let stat;
 
   try {
     stat = statSync(fullPath);
   } catch {
-    return json(res, 404, {
-      error: 'Not found.'
-    });
+    return json(res, 404, { error: 'Not found.' });
   }
 
   if (!stat.isFile()) {
-    return json(res, 404, {
-      error: 'Not found.'
-    });
+    return json(res, 404, { error: 'Not found.' });
   }
 
-  const type =
-    MIME_TYPES[path.extname(fullPath).toLowerCase()] ||
-    'application/octet-stream';
-
   res.writeHead(200, {
-    'Content-Type': type,
+    'Content-Type': MIME[path.extname(fullPath).toLowerCase()] || 'application/octet-stream',
     'Content-Length': stat.size,
-    'Cache-Control': 'no-store',
+    'Cache-Control': path.extname(fullPath) === '.html' ? 'no-store' : 'public, max-age=300',
     'X-Content-Type-Options': 'nosniff'
   });
 
@@ -796,4 +636,44 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const url = new URL(
-      req
+      req.url,
+      `http://${req.headers.host || 'localhost'}`
+    );
+
+    if (url.pathname === '/api/health' && req.method === 'GET') {
+      return health(req, res);
+    }
+
+    if (url.pathname === '/api/chat' && req.method === 'POST') {
+      return await handleChat(req, res);
+    }
+
+    if (url.pathname.startsWith('/api/')) {
+      return json(res, 404, { error: 'API route not found.' });
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return json(
+        res,
+        405,
+        { error: 'Method not allowed.' },
+        { Allow: 'GET, HEAD' }
+      );
+    }
+
+    return serveStatic(req, res);
+  } catch (error) {
+    if (res.headersSent) return res.end();
+
+    return json(res, error.status || 500, {
+      error: error.status ? error.message : 'Unexpected server error.'
+    });
+  }
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`Lumina-1.0 listening on ${HOST}:${PORT}`);
+  console.log(`Groq API key configured: ${Boolean(GROQ_API_KEY)}`);
+});
+
+export { server };
