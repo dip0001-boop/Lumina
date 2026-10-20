@@ -2,9 +2,11 @@
   "name": "lumina-1-0-web",
   "version": "1.0.0",
   "private": true,
-  "description": "Lumina-1.0 web service with Groq GPT-OSS-120B inference and a protected fine-tuning worker adapter.",
+  "description": "Lumina-1.0 web service with hosted inference and local browser training.",
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
     "test": "node --test service.test.js"
